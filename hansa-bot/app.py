@@ -8,6 +8,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from math_solver import solve_math_challenge
 
 
 BASE_URL = os.getenv("HANSA_BASE_URL", "").rstrip("/")
@@ -36,6 +37,8 @@ EP_DAILY_QUESTS = "/api/agents/daily-quests"
 EP_LEADERBOARD = "/api/agents/daily-points-leaderboard"
 EP_CHECKIN = "/api/agents/checkin"
 EP_SUBMIT = os.getenv("EP_SUBMIT", "/api/agents/submit")
+EP_RED_PACKET_CURRENT = os.getenv("EP_RED_PACKET_CURRENT", "/api/agents/red-packet/current")
+EP_RED_PACKET_CLAIM = os.getenv("EP_RED_PACKET_CLAIM", "/api/agents/red-packet/claim")
 
 
 session = requests.Session()
@@ -178,6 +181,81 @@ def normalize_list(data: Any) -> List[Dict[str, Any]]:
             if isinstance(data.get(k), list):
                 return data[k]
     return []
+
+
+def find_red_packet_payload(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not data:
+        return None
+    if isinstance(data.get("data"), dict):
+        return data["data"]
+    if isinstance(data.get("redPacket"), dict):
+        return data["redPacket"]
+    if isinstance(data.get("item"), dict):
+        return data["item"]
+    if "id" in data and ("question" in data or "mathQuestion" in data):
+        return data
+    return None
+
+
+def extract_question(payload: Dict[str, Any]) -> Optional[str]:
+    for k in ("question", "mathQuestion", "challengeQuestion", "quiz"):
+        v = payload.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    challenge = payload.get("challenge")
+    if isinstance(challenge, dict):
+        for k in ("question", "mathQuestion"):
+            v = challenge.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return None
+
+
+def claim_red_packet(payload: Dict[str, Any]) -> bool:
+    packet_id = payload.get("id") or payload.get("redPacketId")
+    question = extract_question(payload)
+    if not packet_id or not question:
+        return False
+
+    answer = solve_math_challenge(question)
+    body = {"id": packet_id, "answer": answer}
+    try:
+        resp = api_post(EP_RED_PACKET_CLAIM, body)
+        log("red_packet_claim", "ok", str(resp), task_id=str(packet_id))
+        print(f"[red-packet] success id={packet_id} answer={answer}")
+        return True
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "?"
+        detail = e.response.text if e.response is not None else str(e)
+        log("red_packet_claim", "error", f"status={status} {detail}", task_id=str(packet_id))
+        print(f"[red-packet] failed id={packet_id} status={status}")
+        return False
+
+
+def monitor_red_packet_window(seconds: int = 240, interval: float = 0.5) -> bool:
+    deadline = time.time() + seconds
+    seen_packet_ids = set()
+    attempt = 0
+
+    while time.time() < deadline:
+        attempt += 1
+        try:
+            data = api_get(EP_RED_PACKET_CURRENT)
+            payload = find_red_packet_payload(data)
+            if payload:
+                packet_id = str(payload.get("id") or payload.get("redPacketId") or "")
+                if packet_id and packet_id not in seen_packet_ids:
+                    seen_packet_ids.add(packet_id)
+                    print(f"[red-packet] detected at attempt={attempt}, id={packet_id}")
+                    if claim_red_packet(payload):
+                        return True
+        except Exception as e:
+            log("red_packet_poll", "error", str(e))
+
+        time.sleep(interval)
+
+    print("[red-packet] monitor ended without successful claim")
+    return False
 
 
 def get_leaderboard() -> List[Dict[str, Any]]:
@@ -397,6 +475,9 @@ def main() -> None:
     sub.add_parser("run")
     sub.add_parser("once")
     sub.add_parser("manual-next")
+    sub.add_parser("redpacket-monitor")
+    sm = sub.add_parser("solve-math")
+    sm.add_argument("--question", type=str, required=True)
 
     ms = sub.add_parser("manual-submit")
     ms.add_argument("--id", type=int, required=True)
@@ -408,6 +489,10 @@ def main() -> None:
 
     if args.cmd == "once":
         one_cycle()
+    elif args.cmd == "redpacket-monitor":
+        monitor_red_packet_window()
+    elif args.cmd == "solve-math":
+        print(solve_math_challenge(args.question))
     elif args.cmd == "manual-next":
         manual_next()
     elif args.cmd == "manual-submit":
